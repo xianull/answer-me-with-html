@@ -95,7 +95,7 @@ function parseFrontmatter(lines, base, allowed) {
   if (end === -1) throw new ParseError("frontmatter \u672A\u95ED\u5408\uFF1A\u7F3A\u5C11\u7ED3\u675F\u884C ---", 1);
   const entries = {};
   for (let i = 1; i < end; i++) {
-    const raw = lines[i].replace(/\s+#.*$/, "").trim();
+    const raw = stripLineComment(lines[i]).trim();
     if (!raw || raw.startsWith("#")) continue;
     const m = raw.match(/^([\w-]+)\s*:\s*(.*)$/);
     if (!m) throw new ParseError(`frontmatter \u65E0\u6CD5\u89E3\u6790\uFF1A"${lines[i]}"\uFF0C\u5E94\u4E3A key: value`, i + 1);
@@ -203,6 +203,22 @@ function assignIds(panels) {
 function unquote(v) {
   const s = v.trim();
   return /^(["']).*\1$/.test(s) ? s.slice(1, -1) : s;
+}
+function stripLineComment(line) {
+  let quote = "";
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (quote) {
+      if (c === quote) quote = "";
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      quote = c;
+      continue;
+    }
+    if (c === "#" && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
+  }
+  return line;
 }
 function coerce(key, value) {
   if (NUMERIC_KEYS.has(key) && /^\d+$/.test(value)) return Number(value);
@@ -1842,6 +1858,7 @@ function liHtml(n) {
 var NICE_MAX = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
 var NICE_STEP = [1, 2, 2.5, 5, 10];
 function niceScale(peak) {
+  if (!Number.isFinite(peak) || peak <= 0) return { max: 1, step: 1 };
   const target = peak * 1.4;
   const pow = 10 ** Math.floor(Math.log10(target));
   const integral = Number.isInteger(peak);
@@ -1885,7 +1902,9 @@ function rowHtml({ label, value, limit, unit, note }) {
   const over = value !== null && value > limit;
   const valText = `${value !== null ? `${value} / ` : ""}max ${limit}${unit ? ` ${unit}` : ""}`;
   const ticks = [];
-  for (let v = 0; v <= max + 1e-9; v += step) ticks.push(`<span style="left: ${pct(round(v), max)}">${round(v)}</span>`);
+  if (step > 0 && max > 0) {
+    for (let v = 0; v <= max + 1e-9; v += step) ticks.push(`<span style="left: ${pct(round(v), max)}">${round(v)}</span>`);
+  }
   return `<div class="am-lim${over ? " is-over" : ""}">
 <div class="am-lim-head"><span>${esc(label)}${note ? `<span class="am-lim-note">${esc(note)}</span>` : ""}</span><span class="am-lim-val">${esc(valText)}</span></div>
 <div class="am-lim-track"><div class="am-lim-fill" style="width: ${pct(shown, max)}"></div><div class="am-lim-mark" style="left: ${pct(limit, max)}"></div></div>
@@ -4979,8 +4998,12 @@ function captionHtml(raw) {
     return m ? `<b>${esc(m[1])}</b>` : esc(part);
   }).join("");
 }
+function formatClock(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
 function titleScene(meta, introHtml, { scenes, duration }) {
-  const mmss = `${Math.floor(duration / 60)}:${String(Math.round(duration % 60)).padStart(2, "0")}`;
+  const mmss = formatClock(duration);
   const cells = [["DRAWN", "Answer me with HTML"], ["DATE", timestamp().slice(0, 10)], ["SCENES", String(scenes)], ["DURATION", mmss]];
   const block2 = `<div class="amv-titleblock">${cells.map(([k2, v]) => `<div><b>${k2}</b><span>${esc(v)}</span></div>`).join("")}</div>`;
   return `<section class="amv-scene amv-scene--title" data-i="0">
