@@ -1,4 +1,4 @@
-// am CLI：render / lint / list / help。main() 接收注入的流与环境变量，方便测试。
+// am CLI：render / patch / lint / list / help。main() 接收注入的流与环境变量，方便测试。
 
 import { parseArgs } from 'node:util';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -13,7 +13,10 @@ import { THEMES } from './themes/index.js';
 import { renderVideo } from './video/render.js';
 import { pickProvider, TtsError, VOICES } from './video/tts.js';
 import { exportMp4, ExportError } from './video/export.js';
+import { afterRender, clean, usage, mb, CLEAN } from './housekeeping.js';
+import { runUpdateCheck } from './update.js';
 import { amHome, readConfig, setConfig, resetConfig, CONFIG_KEYS, ConfigError } from './config.js';
+import { extractSource, replacePanel, pageSettings, PatchError } from './patch.js';
 
 const MAX_LISTED_WARNINGS = 20;
 
@@ -22,17 +25,21 @@ const USAGE = `Answer me with HTML ${VERSION} — 把 Markdown 内容稿渲染�
 用法:
   am render <file|->  [-o 输出路径] [--no-open] [--theme blueprint|shadcn]
                       [--template sheet|doc] [--style off|80|strict] [--mode auto|light|dark]
+  am patch  <html> --panel <标题> [file|-] [--from file] [--theme …] [--no-open]
+                                                  替换已有页面中的一个 ## 面板，原地覆盖该 HTML
   am video  <file|->  [-o 输出路径] [--voice auto|elevenlabs|system|off] [--mp4] [--no-open]
                       [--theme blueprint|shadcn|3b1b] [--mode light|dark]
                                                   把视频稿渲染成 3b1b 风格的解释视频播放页（--mp4 另存视频文件）
   am lint   <file|->  [--style off|80|strict]     只做 STE 受控写作检查
   am config [set <键> <值> | get <键> | reset [键]] 查看或修改配置
+  am clean  [--days 30] [--all] [--dry-run]       清理旧页面、旧视频和配音缓存
   am list                                         列出模板、主题、组件
-  am help [组件名|format]                          查看组件语法 / 稿件格式
+  am help [组件名|format|video|patch]              查看组件语法 / 页面稿格式 / 视频稿格式 / patch 用法
 
 - 文件参数写 - 表示从 stdin 读取（适合 heredoc：am render - <<'EOF' ... EOF）。
 - 默认输出到 ~/.answer-me-with-html/pages/（可用环境变量 AM_HOME 修改）。
-- 是否自动打开浏览器、默认主题等用 am config 设置；--open / --no-open 只影响这一次。`;
+- 是否自动打开浏览器、默认主题等用 am config 设置；--open / --no-open 只影响这一次。
+- am patch 从页面隐藏的 #am-source 取回源稿，只改 --panel 对应的 ## 小节，再按原路径写回。`;
 
 const FORMAT = `稿件格式（扩展 Markdown）
 
@@ -62,6 +69,16 @@ A -> B
 
 - "## " 开启一个面板；字母 ID 可省略（自动分配 A、B、C…）。span 让面板跨列。
 - 组件列表见 am list；单个组件语法见 am help <组件名>。`;
+
+const RAW_HELP = `LANG — 原样嵌入（逃生口）
+
+围栏块语言名写 LANG 时，内容不经处理直接放进页面。只在现有组件表达不了时使用；
+颜色请用主题变量（如 var(--ink)、var(--accent)），这样切换主题和明暗时也能看清。
+
+示例：
+\`\`\`LANG
+<div style="color: var(--accent)">任意内容</div>
+\`\`\``;
 
 const VIDEO_FORMAT = `视频稿格式（am video）
 
@@ -115,6 +132,11 @@ export async function main(argv, io = {}) {
         mode: { type: 'string' },
         voice: { type: 'string' },
         mp4: { type: 'boolean' },
+        panel: { type: 'string' },
+        from: { type: 'string' },
+        days: { type: 'string' },
+        all: { type: 'boolean' },
+        'dry-run': { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -129,10 +151,13 @@ export async function main(argv, io = {}) {
   if (opts.help || !cmd) return print(USAGE), 0;
 
   switch (cmd) {
-    case 'render': return withSource(arg, io, fail, (src) => cmdRender(src, opts, { print, fail, env, cwd: io.cwd }));
-    case 'video': return withSource(arg, io, fail, (src) => cmdVideo(src, opts, { print, fail, env, cwd: io.cwd, provider: io.ttsProvider }));
+    case 'render': return withSource(arg, io, fail, (src) => cmdRender(src, opts, { print, fail, env, io }));
+    case 'patch': return cmdPatch(arg, rest[0], opts, { print, fail, env, io });
+    case 'video': return withSource(arg, io, fail, (src) => cmdVideo(src, opts, { print, fail, env, io }));
     case 'lint': return withSource(arg, io, fail, (src) => cmdLint(src, opts, { print, fail }));
     case 'config': return cmdConfig([arg, ...rest].filter((x) => x !== undefined), { print, fail, env });
+    case 'clean': return cmdClean(opts, { print, fail, env });
+    case '__update-check': return (await runUpdateCheck(amHome(env))) ? 0 : 1;
     case 'list': return cmdList(print), 0;
     case 'help': return cmdHelp(arg, { print, fail });
     default:
@@ -175,9 +200,9 @@ export function shouldOpen(opts, env, config) {
   return config.open !== false;
 }
 
-function cmdRender(src, opts, { print, fail, env, cwd }) {
-  const config = readConfig(env);
-  if (config.warning) fail(`! ${config.warning}`);
+function cmdRender(src, opts, ctx) {
+  const { print, fail, env } = ctx;
+  const config = loadConfig(ctx);
   const { theme, mode, style } = config.values;
   let result;
   try {
@@ -185,23 +210,89 @@ function cmdRender(src, opts, { print, fail, env, cwd }) {
   } catch (e) {
     return reportError(e, fail);
   }
-  const file = opts.out
-    ? resolve(cwd ?? process.cwd(), opts.out)
-    : join(amHome(env), 'pages', `${slug(result.meta.title)}-${stamp()}.html`);
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, result.html);
-
+  const file = writeOutput(result.html, 'pages', result.meta.title, opts, ctx);
   const comps = Object.entries(result.stats.components).map(([k, v]) => `${k}×${v}`).join(' ');
   print(`✓ ${file}`);
   print(`  ${result.meta.template} · ${result.meta.theme} · ${result.stats.panels} 面板${comps ? ` · ${comps}` : ''}`);
   printWarnings(result.warnings, print, result.meta.style);
-  if (shouldOpen(opts, env, config.values)) openFile(file);
-  return 0;
+  return finish(file, opts, config, ctx);
 }
 
-async function cmdVideo(src, opts, { print, fail, env, cwd, provider: injected }) {
-  const config = readConfig(env);
-  if (config.warning) fail(`! ${config.warning}`);
+const PATCH_HELP = `原地替换已渲染页面中的一个面板
+
+用法:
+  am patch <html-file> --panel <标题> < new-panel.md
+  am patch <html-file> --panel <标题> --from new-panel.md
+  am patch <html-file> --panel <标题> -
+
+- 从 <html-file> 里隐藏的 <textarea id="am-source"> 取回源稿。
+- --panel 匹配 ## 小节的标题、字母 ID，或 "ID 标题"。
+- 新稿件从 stdin 或 --from / 第二个文件参数读取：可带 ## 标题，也可只写面板正文。
+- 用现有 renderer 重渲后覆盖同一个 HTML 路径，不另写带时间戳的新文件。
+- 找不到该面板，或页面没有 #am-source，退出码非 0 且不改文件。`;
+
+async function cmdPatch(htmlArg, fromArg, opts, ctx) {
+  const { print, fail, io } = ctx;
+  if (!htmlArg || htmlArg === '-') {
+    fail(htmlArg ? '✗ patch 需要已有 HTML 文件路径，不能从 stdin 读页面' : '✗ 缺少 HTML 文件路径');
+    return 2;
+  }
+  if (!opts.panel || !String(opts.panel).trim()) {
+    fail('✗ 缺少 --panel <标题>');
+    return 2;
+  }
+  const cwd = io.cwd ?? process.cwd();
+  const file = resolve(cwd, htmlArg);
+  let html;
+  try {
+    html = readFileSync(file, 'utf8');
+  } catch (e) {
+    fail(`✗ 无法读取 HTML：${e.message}`);
+    return 2;
+  }
+  const source = extractSource(html);
+  if (source == null) {
+    fail('✗ 页面里没有 #am-source，无法取回源稿');
+    return 1;
+  }
+  const from = opts.from ?? fromArg;
+  let replacement;
+  try {
+    replacement = !from || from === '-' ? await readStream(io.stdin ?? process.stdin) : readFileSync(resolve(cwd, from), 'utf8');
+  } catch (e) {
+    fail(`✗ 无法读取新面板稿件：${e.message}`);
+    return 2;
+  }
+  let patched;
+  try {
+    patched = replacePanel(source, opts.panel, replacement);
+  } catch (e) {
+    if (!(e instanceof PatchError)) return reportError(e, fail);
+    fail(`✗ ${e.message}`);
+    return 1;
+  }
+  const config = loadConfig(ctx);
+  const { theme, mode, style } = config.values;
+  // 沿用原页面的模板、主题与明暗（生成时可能用过 --theme 等参数）；本次命令行参数优先。
+  const page = pageSettings(html);
+  const overrides = { template: opts.template ?? page.template, theme: opts.theme ?? page.theme, mode: opts.mode ?? page.mode, style: opts.style };
+  let result;
+  try {
+    result = renderDoc(patched, overrides, { theme, mode, style });
+  } catch (e) {
+    return reportError(e, fail);
+  }
+  writeFileSync(file, result.html);
+  const comps = Object.entries(result.stats.components).map(([k, v]) => `${k}×${v}`).join(' ');
+  print(`✓ ${file}`);
+  print(`  ${result.meta.template} · ${result.meta.theme} · ${result.stats.panels} 面板${comps ? ` · ${comps}` : ''}`);
+  printWarnings(result.warnings, print, result.meta.style);
+  return finish(file, opts, config, ctx);
+}
+
+async function cmdVideo(src, opts, ctx) {
+  const { print, fail } = ctx;
+  const config = loadConfig(ctx);
   const voice = opts.voice ?? config.values.voice;
   if (!VOICES.includes(voice)) {
     fail(`✗ voice 的值 "${voice}" 无效，可选：${VOICES.join(' | ')}`);
@@ -209,44 +300,97 @@ async function cmdVideo(src, opts, { print, fail, env, cwd, provider: injected }
   }
   let result;
   try {
-    const provider = injected !== undefined ? injected : pickProvider(voice, env);
-    result = await renderVideo(src, {
-      provider,
-      cacheDir: join(amHome(env), 'cache', 'tts'),
-      defaults: { style: config.values.style, theme: config.values.theme, mode: config.values.mode },
-      overrides: { style: opts.style, theme: opts.theme, mode: opts.mode },
-      onProgress: (msg) => fail(`  ${msg}`),
-    });
-    result.voiceName = provider ? provider.name : '无（只出字幕）';
+    result = await buildVideo(src, voice, opts, config, ctx);
   } catch (e) {
-    if (e instanceof TtsError) {
-      fail(`✗ 配音失败：${e.message}。可加 --voice off 只出字幕`);
-      return 1;
-    }
-    return reportError(e, fail);
+    if (!(e instanceof TtsError)) return reportError(e, fail);
+    fail(`✗ 配音失败：${e.message}。可加 --voice off 只出字幕`);
+    return 1;
   }
-  const file = opts.out
-    ? resolve(cwd ?? process.cwd(), opts.out)
-    : join(amHome(env), 'videos', `${slug(result.meta.title)}-${stamp()}.html`);
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, result.html);
+  const file = writeOutput(result.html, 'videos', result.meta.title, opts, ctx);
   print(`✓ ${file}`);
   print(`  video · ${result.stats.panels} 场景 · ${result.beats} 句旁白 · ${result.duration.toFixed(1)}s · 配音：${result.voiceName}`);
   printWarnings(result.warnings, print, result.meta.style);
+  if (opts.mp4 && !(await exportVideoMp4(file, result.wav, ctx))) return 1;
+  return finish(file, opts, config, ctx);
+}
 
-  if (opts.mp4) {
-    const mp4 = file.replace(/\.html?$/i, '') + '.mp4';
-    try {
-      const started = Date.now();
-      await exportMp4(file, mp4, { wav: result.wav, env, onProgress: (i, n) => fail(`  导出 MP4：${i}/${n} 帧`) });
-      print(`✓ ${mp4}（${((Date.now() - started) / 1000).toFixed(0)}s 导出）`);
-    } catch (e) {
-      if (!(e instanceof ExportError)) throw e;
-      fail(`✗ MP4 导出失败：${e.message}。播放页已生成，可直接在浏览器播放`);
-      return 1;
-    }
+async function buildVideo(src, voice, opts, config, { fail, env, io }) {
+  const provider = io.ttsProvider !== undefined ? io.ttsProvider : pickProvider(voice, env);
+  const result = await renderVideo(src, {
+    provider,
+    cacheDir: join(amHome(env), 'cache', 'tts'),
+    defaults: { style: config.values.style, theme: config.values.theme, mode: config.values.mode },
+    overrides: { style: opts.style, theme: opts.theme, mode: opts.mode },
+    onProgress: (msg) => fail(`  ${msg}`),
+  });
+  return { ...result, voiceName: provider ? provider.name : '无（只出字幕）' };
+}
+
+async function exportVideoMp4(file, wav, { print, fail, env }) {
+  const mp4 = `${file.replace(/\.html?$/i, '')}.mp4`;
+  const started = Date.now();
+  try {
+    await exportMp4(file, mp4, { wav, env, onProgress: (i, n) => fail(`  导出 MP4：${i}/${n} 帧`) });
+  } catch (e) {
+    if (!(e instanceof ExportError)) throw e;
+    fail(`✗ MP4 导出失败：${e.message}。播放页已生成，可直接在浏览器播放`);
+    return false;
   }
-  if (shouldOpen(opts, env, config.values)) openFile(file);
+  print(`✓ ${mp4}（${((Date.now() - started) / 1000).toFixed(0)}s 导出）`);
+  return true;
+}
+
+function loadConfig({ fail, env }) {
+  const config = readConfig(env);
+  if (config.warning) fail(`! ${config.warning}`);
+  return config;
+}
+
+// 写出页面：-o 指定时写到该路径，否则写进数据目录的 pages/ 或 videos/。
+function writeOutput(html, dir, title, opts, { env, io }) {
+  const file = opts.out
+    ? resolve(io.cwd ?? process.cwd(), opts.out)
+    : join(amHome(env), dir, `${slug(title)}-${stamp()}.html`);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, html);
+  return file;
+}
+
+// 渲染成功后的收尾：打印维护提示，按配置打开浏览器。
+function finish(file, opts, config, ctx) {
+  printHints(config, ctx);
+  if (shouldOpen(opts, ctx.env, config.values)) openFile(file);
+  return 0;
+}
+
+// 渲染成功后附带的提示（清理、更新），给 Agent 看，由 Agent 询问用户。
+function printHints(config, { env, io, print }) {
+  try {
+    const hints = afterRender({
+      home: amHome(env), env, config: config.values, current: VERSION,
+      scriptPath: io.scriptPath, background: Boolean(io.background),
+    });
+    hints.forEach((h) => print(h));
+  } catch {
+    // 维护提示出错不影响渲染结果。
+  }
+}
+
+function cmdClean(opts, { print, fail, env }) {
+  if (opts.days !== undefined && !/^\d+$/.test(opts.days.trim())) {
+    fail('✗ --days 需要非负整数');
+    return 2;
+  }
+  const days = opts.days === undefined ? CLEAN.days : Number(opts.days);
+  const home = amHome(env);
+  const before = usage(home);
+  const dry = Boolean(opts['dry-run']);
+  const r = clean(home, { days, all: Boolean(opts.all), dryRun: dry });
+  const scope = opts.all ? '全部页面和视频' : `${days} 天前的页面和视频`;
+  print(`数据目录：${home}（共 ${mb(before.total)}：页面 ${before.pages.count} 个，视频 ${before.videos.count} 个，配音缓存 ${mb(before.cache.bytes)}）`);
+  print(dry
+    ? `将删除 ${r.files} 个文件，释放 ${mb(r.bytes)}（${scope} + 配音缓存）。去掉 --dry-run 执行。`
+    : `✓ 已删除 ${r.files} 个文件，释放 ${mb(r.bytes)}（${scope} + 配音缓存）。配置已保留。`);
   return 0;
 }
 
@@ -326,7 +470,7 @@ function cmdConfig(args, { print, fail, env }) {
   for (const [k, spec] of Object.entries(CONFIG_KEYS)) {
     const mark = k in stored ? '*' : ' ';
     const options = spec.type === 'bool' ? 'on | off' : spec.choices.join(' | ');
-    print(`${mark} ${k.padEnd(7)}${showValue(values[k]).padEnd(10)}${spec.label}（${options}）`);
+    print(`${mark} ${k.padEnd(13)}${showValue(values[k]).padEnd(10)}${spec.label}（${options}）`);
   }
   if (env.AM_NO_OPEN && env.AM_NO_OPEN !== '0') print('注意：环境变量 AM_NO_OPEN 生效中，会覆盖 open 配置。');
   print('* 表示你改过的值。修改：am config set <键> <值>；恢复默认：am config reset [键]');
@@ -350,9 +494,11 @@ function cmdHelp(name, { print, fail }) {
   if (!name) return print(USAGE), 0;
   if (name === 'format') return print(FORMAT), 0;
   if (name === 'video') return print(VIDEO_FORMAT), 0;
+  if (name === 'patch') return print(PATCH_HELP), 0;
+  if (name === 'html' || name === 'svg') return print(RAW_HELP.replace(/LANG/g, name)), 0;
   const comp = COMPONENTS.get(name);
   if (!comp) {
-    fail(`✗ 没有组件 "${name}"。可用：${[...COMPONENTS.keys()].join(', ')}, format`);
+    fail(`✗ 没有组件 "${name}"。可用：${[...COMPONENTS.keys()].join(', ')}, html, svg, format, video, patch`);
     return 2;
   }
   print(`${comp.name} — ${comp.summary}\n\n${comp.syntax}\n\n示例：\n${comp.example}`);

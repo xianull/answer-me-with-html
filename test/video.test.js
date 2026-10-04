@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseVideo, estimateSeconds, buildTimeline, allBeats, TIMING } from '../src/video/script.js';
-import { renderVideo, captionHtml } from '../src/video/render.js';
+import { renderVideo, captionHtml, formatClock } from '../src/video/render.js';
 import { readWav, wav, mixTrack, trimSilence, synthAll, pickProvider, pickMacVoices, TtsError, SAMPLE_RATE } from '../src/video/tts.js';
 import { findChrome } from '../src/video/export.js';
 import { renderDoc } from '../src/render.js';
@@ -88,6 +88,13 @@ test('buildTimeline: 片头 → 场景切换 → 旁白依次排开，时间单�
   assert.equal(noIntro.scenes[0].start, TIMING.title, '没有片头旁白时停留固定时长');
 });
 
+test('formatClock: 四舍五入后进位到下一分钟，不出现 0:60', () => {
+  assert.equal(formatClock(59.6), '1:00');
+  assert.equal(formatClock(59.4), '0:59');
+  assert.equal(formatClock(0), '0:00');
+  assert.equal(formatClock(90), '1:30');
+});
+
 test('captionHtml: 转义 HTML，[名字] 变成高亮词', () => {
   assert.equal(captionHtml('[Server] 回 <ACK>'), '<b>Server</b> 回 &lt;ACK&gt;');
 });
@@ -141,6 +148,16 @@ test('pickMacVoices: 名字很长只隔一个空格时也能认出，优先婷�
 });
 
 // ── 渲染 ──
+test('renderVideo: 片头时长进位到 1:00，不写成 0:60', async () => {
+  const samples = new Int16Array(Math.round(54 * SAMPLE_RATE));
+  samples.fill(1000);
+  const r = await renderVideo(`---\ntitle: Dur\n---\n## S\n\`\`\`flow\nA -> B\n\`\`\`\n> beat\n`, {
+    provider: { name: 'fake', id: 'fake', concurrency: 1, synth: async () => samples },
+  });
+  assert.ok(Math.abs(r.duration - 59.6) < 0.05, r.duration);
+  assert.match(r.html, /DURATION<\/b><span>1:00<\/span>/);
+});
+
 test('renderVideo: 无配音时按估算时长出播放页，场景与数据齐全', async () => {
   const r = await renderVideo(SRC);
   assert.equal(r.wav, null);
@@ -210,7 +227,10 @@ function sink() {
   return { stream, get text() { return text; } };
 }
 
-async function run(args, { stdin = '', env = {}, ttsProvider = null } = {}) {
+// 不传 ttsProvider 时用 null（只出字幕）；显式传 undefined 时走真实的配音选择逻辑。
+async function run(args, opts = {}) {
+  const { stdin = '', env = {} } = opts;
+  const ttsProvider = 'ttsProvider' in opts ? opts.ttsProvider : null;
   const out = sink();
   const err = sink();
   const code = await main(args, {
@@ -266,4 +286,37 @@ test('e2e: --mp4 导出 1080p30 带音轨的视频', { skip: !E2E, timeout: 1200
   const probe = execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,width,height', '-of', 'csv=p=0', join(dir, 'e2e.mp4')], { encoding: 'utf8' });
   assert.match(probe, /video,1920,1080/);
   assert.match(probe, /audio/);
+});
+
+// ── 审查后的修复 ──
+test('synthAll: 损坏的缓存（奇数字节）视为未命中并重新合成', async () => {
+  const { writeFileSync: write, readdirSync: list } = await import('node:fs');
+  const p = fakeProvider();
+  const cacheDir = join(dir, 'cache-broken');
+  await synthAll(['坏缓存'], p, { cacheDir });
+  const [f] = list(cacheDir);
+  write(join(cacheDir, f), Buffer.alloc(3));
+  await synthAll(['坏缓存'], p, { cacheDir });
+  assert.equal(p.calls.length, 2);
+  assert.ok(list(cacheDir).every((n) => !n.endsWith('.tmp')), '不留临时文件');
+});
+
+test('ElevenLabs: 网络错误包装成 TtsError，CLI 给出 --voice off 提示', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new TypeError('fetch failed'); };
+  try {
+    const p = pickProvider('elevenlabs', { ELEVENLABS_API_KEY: 'k' });
+    await assert.rejects(p.synth('你好'), (e) => e instanceof TtsError && /无法连接 ElevenLabs/.test(e.message));
+    const r = await run(['video', '-', '--voice', 'elevenlabs'], { stdin: SRC, env: { ELEVENLABS_API_KEY: 'k' }, ttsProvider: undefined });
+    assert.equal(r.code, 1);
+    assert.match(r.err, /配音失败：无法连接 ElevenLabs.*--voice off/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('e2e: 以 - 开头的旁白不会被系统 TTS 当成选项', { skip: !E2E }, async () => {
+  const p = pickProvider('system', process.env);
+  const [clip] = await synthAll(['-v 这句以连字符开头'], p, {});
+  assert.ok(clip.length / SAMPLE_RATE > 0.5);
 });
