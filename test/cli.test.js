@@ -50,6 +50,12 @@ test('cli render: 文件参数 + -o + 主题覆盖', async () => {
   assert.match(readFileSync(join(dir, 'out/x.html'), 'utf8'), /data-theme="shadcn"/);
 });
 
+test('cli render: limits 0 / 0 能出页，不挂起', { timeout: 5000 }, async () => {
+  const r = await run(['render', '-', '-o', 'zero.html'], { stdin: '## A\n```limits\nx | 0 / 0\n```\n' });
+  assert.equal(r.code, 0, r.err);
+  assert.match(readFileSync(join(dir, 'zero.html'), 'utf8'), /am-lim/);
+});
+
 test('cli render: 组件语法错误 → 绝对行号 + 组件名 + 正确示例，退出码 1', async () => {
   const r = await run(['render', '-'], { stdin: '## A\n文本\n```flow\nA -> B\n(未闭合 -> C\n```' });
   assert.equal(r.code, 1);

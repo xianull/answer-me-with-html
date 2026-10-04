@@ -30,7 +30,7 @@ description: >-
 - `config <键> <值>`：运行 `am config set <键> <值>`。
 - `config reset [键]`：运行 `am config reset [键]`。
 
-用户用自然语言提出时（"别再自动弹浏览器了""关掉高频模式""默认用卡片主题"），同样换算成 `am config set`。可配置项：`open`（自动打开浏览器）、`always`（高频模式）、`theme`、`mode`、`style`，运行 `am config` 可看全部说明。
+用户用自然语言提出时（"别再自动弹浏览器了""关掉高频模式""默认用卡片主题""不要配音"），同样换算成 `am config set`。可配置项：`open`（自动打开浏览器）、`always`（高频模式）、`theme`、`mode`、`style`、`voice`（视频配音），运行 `am config` 可看全部说明。
 
 ## 1. 判断：要不要出页面
 
